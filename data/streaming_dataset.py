@@ -107,7 +107,8 @@ class MinuteBarDataset(IterableDataset):
     Args:
         start:     First date (inclusive).
         end:       Last date (inclusive).
-        seq_len:   Number of bars per input window (default 60 = 1 hour).
+        seq_len:   Number of bars per input window (default 60 = 1 hour lookback).
+        horizon:   Number of bars ahead to predict return over (default 60 = 1 hour).
         tickers:   Optional allowlist; None streams all tickers.
         prefetch:  Number of daily files to buffer ahead (default 4).
     """
@@ -117,12 +118,14 @@ class MinuteBarDataset(IterableDataset):
         start: date,
         end: date,
         seq_len: int = 60,
+        horizon: int = 60,
         tickers: list[str] | None = None,
         prefetch: int = 4,
     ):
         self.start    = start
         self.end      = end
         self.seq_len  = seq_len
+        self.horizon  = horizon
         self.tickers  = set(tickers) if tickers else None
         self.prefetch = prefetch
         self._keys: list[str] | None = None
@@ -156,15 +159,17 @@ class MinuteBarDataset(IterableDataset):
                 for ticker, group in df.groupby("ticker", sort=False):
                     if self.tickers and ticker not in self.tickers:
                         continue
-                    if len(group) < self.seq_len + 1:
+                    if len(group) < self.seq_len + self.horizon:
                         continue
 
                     features = _make_features(group.reset_index(drop=True))
                     closes   = group["close"].values
 
-                    for i in range(len(features) - self.seq_len):
-                        window = features[i : i + self.seq_len]
-                        label  = float(closes[i + self.seq_len] > closes[i + self.seq_len - 1])
+                    for i in range(len(features) - self.seq_len - self.horizon + 1):
+                        window      = features[i : i + self.seq_len]
+                        entry_close = closes[i + self.seq_len - 1]
+                        exit_close  = closes[i + self.seq_len + self.horizon - 1]
+                        label       = float(np.log(exit_close / max(entry_close, 1e-8)))
                         yield torch.from_numpy(window), torch.tensor(label, dtype=torch.float32)
 
                 bar.update(1)
