@@ -101,12 +101,14 @@ def _simulate_day(
 ) -> tuple[list[dict], int]:
     """Score all tickers, select top signals, simulate trades. Returns (trades, final_open_positions)."""
     all_candidates = []
+    tickers = list(df.groupby("ticker", sort=False))
 
-    for ticker, group in df.groupby("ticker", sort=False):
+    for ticker, group in tqdm(tickers, desc="  tickers", unit="ticker", leave=False):
         candidates = _score_ticker(group.reset_index(drop=True), model, device)
         for c in candidates:
             c["ticker"] = ticker
         all_candidates.extend(candidates)
+
 
     # Sort by signal strength, take top signals respecting position cap
     all_candidates.sort(key=lambda c: abs(c["prediction"]), reverse=True)
