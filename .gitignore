@@ -30,6 +30,7 @@ backtest_trades.xlsx
 
 # Trained model weights
 ml/*.pt
+ml/checkpoints/
 
 # IDE / tooling
 .claude/
