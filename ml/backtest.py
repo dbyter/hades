@@ -1,8 +1,9 @@
 """
 Backtest the trained model on held-out minute-bar data.
 
-For each day, slides the model across every ticker's bars, collects signals,
-simulates entries at the next bar's open, exits 60 bars later.
+Scans all tickers at 10:00 and 13:00 ET each day. At each scan, scores every
+ticker using the preceding 60 bars, takes the top 10 predictions as longs,
+and holds each position for exactly 60 bars (1 hour).
 
 Usage:
     python -m ml.backtest --checkpoint ml/checkpoints/model_step00010000.pt
@@ -10,6 +11,8 @@ Usage:
 
 import argparse
 import gzip
+import queue
+import threading
 from datetime import date
 from pathlib import Path
 
@@ -21,19 +24,19 @@ from tqdm import tqdm
 
 load_dotenv(Path(__file__).parent.parent / ".env")
 
-from data.streaming_dataset import _get_s3, _make_features, list_keys, BARS_IN_SESSION
+from data.streaming_dataset import _get_s3, _make_features, list_keys
 from ml.model import MinuteBarTransformer
 
-BUCKET = "flatfiles"
-
-# ── Config ────────────────────────────────────────────────────────────────────
-
+BUCKET        = "flatfiles"
 SEQ_LEN       = 60
 HORIZON       = 60
-POSITION_SIZE = 1_000.0   # USD per trade
-MAX_POSITIONS = 20        # max concurrent open trades
-THRESHOLD     = 0.003     # min |predicted log return| to open a trade
-COST_RT       = 0.0002    # round-trip cost as fraction (0.02%)
+TRADES_PER_SCAN = 10
+POSITION_SIZE = 1_000.0
+COST_RT       = 0.0002
+
+# Scan times: bar index within the session (9:30 = bar 0)
+# 10:00 = bar 30, 13:00 = bar 210
+SCAN_BARS = [30, 210]
 
 
 # ── Data ──────────────────────────────────────────────────────────────────────
@@ -51,100 +54,77 @@ def _load_day(key: str) -> pd.DataFrame:
     return df.sort_values(["ticker", "dt"]).reset_index(drop=True)
 
 
-# ── Signal generation ─────────────────────────────────────────────────────────
+# ── Simulation ────────────────────────────────────────────────────────────────
 
 def _simulate_day(
     df: pd.DataFrame,
     model: MinuteBarTransformer,
     device: str,
-    open_positions: int,
-) -> tuple[list[dict], int]:
-    """Score all tickers in one batched GPU call, select top signals, simulate trades."""
-    all_windows = []
-    meta        = []  # (ticker, i, opens)
-
+) -> list[dict]:
+    # Build per-ticker feature arrays and price arrays
+    ticker_data = {}
     for ticker, group in df.groupby("ticker", sort=False):
         group = group.reset_index(drop=True)
         if len(group) < SEQ_LEN + HORIZON:
             continue
-        features  = _make_features(group)
-        opens     = group["open"].values
-        n_windows = len(features) - SEQ_LEN - HORIZON + 1
-        for i in range(n_windows):
-            all_windows.append(features[i : i + SEQ_LEN])
-            meta.append((ticker, i, opens))
-
-    if not all_windows:
-        return [], open_positions
-
-    # Chunked forward pass to avoid OOM
-    all_windows_np = np.stack(all_windows)
-    preds = []
-    chunk_size = 4096
-    with torch.no_grad():
-        for i in range(0, len(all_windows_np), chunk_size):
-            chunk = torch.from_numpy(all_windows_np[i : i + chunk_size]).to(device)
-            preds.append(model(chunk).cpu().numpy())
-    preds = np.concatenate(preds)
-
-    all_candidates = []
-    for pred, (ticker, i, opens) in zip(preds, meta):
-        if abs(pred) < THRESHOLD:
-            continue
-        entry_idx = i + SEQ_LEN
-        exit_idx  = i + SEQ_LEN + HORIZON
-        if exit_idx >= len(opens):
-            continue
-        all_candidates.append({
-            "ticker":      ticker,
-            "entry_bar":   entry_idx,
-            "exit_bar":    exit_idx,
-            "entry_price": opens[entry_idx],
-            "exit_price":  opens[exit_idx],
-            "prediction":  float(pred),
-            "direction":   1 if pred > 0 else -1,
-        })
-
-
-    # Sort by signal strength, take top signals respecting position cap
-    all_candidates.sort(key=lambda c: abs(c["prediction"]), reverse=True)
+        ticker_data[ticker] = {
+            "features": _make_features(group),
+            "opens":    group["open"].values,
+        }
 
     trades = []
-    active: dict[str, int] = {}  # ticker -> entry_bar of open trade
 
-    for c in all_candidates:
-        ticker = c["ticker"]
-        if open_positions >= MAX_POSITIONS:
-            break
-        if ticker in active:
+    for scan_bar in SCAN_BARS:
+        windows = []
+        meta    = []
+
+        for ticker, data in ticker_data.items():
+            features = data["features"]
+            opens    = data["opens"]
+
+            # Window ends at scan_bar — need seq_len bars before it
+            window_start = scan_bar - SEQ_LEN
+            if window_start < 0:
+                continue
+
+            entry_idx = scan_bar          # enter at open of scan bar
+            exit_idx  = scan_bar + HORIZON
+
+            if exit_idx >= len(opens):
+                continue
+
+            windows.append(features[window_start:scan_bar])
+            meta.append((ticker, opens[entry_idx], opens[exit_idx]))
+
+        if not windows:
             continue
 
-        entry = c["entry_price"]
-        exit_ = c["exit_price"]
-        if entry <= 0 or exit_ <= 0:
-            continue
+        # Single batched forward pass for this scan
+        batch = torch.from_numpy(np.stack(windows)).to(device)
+        with torch.no_grad():
+            preds = model(batch).cpu().numpy()
 
-        raw_return = c["direction"] * np.log(exit_ / entry)
-        net_return = raw_return - COST_RT
-        pnl        = POSITION_SIZE * net_return
+        # Rank by prediction, take top N as longs
+        ranked = sorted(zip(preds, meta), key=lambda x: x[0], reverse=True)
+        top    = ranked[:TRADES_PER_SCAN]
 
-        trades.append({
-            "ticker":     ticker,
-            "direction":  "long" if c["direction"] == 1 else "short",
-            "entry_bar":  c["entry_bar"],
-            "entry_price": entry,
-            "exit_price":  exit_,
-            "prediction":  c["prediction"],
-            "raw_return":  raw_return,
-            "net_return":  net_return,
-            "pnl":         pnl,
-        })
-        active[ticker] = c["entry_bar"]
-        open_positions += 1
+        for pred, (ticker, entry_price, exit_price) in top:
+            if entry_price <= 0 or exit_price <= 0:
+                continue
+            raw_return = np.log(exit_price / entry_price)
+            net_return = raw_return - COST_RT
+            trades.append({
+                "ticker":       ticker,
+                "scan_bar":     scan_bar,
+                "entry_price":  entry_price,
+                "exit_price":   exit_price,
+                "prediction":   float(pred),
+                "raw_return":   raw_return,
+                "net_return":   net_return,
+                "pnl":          POSITION_SIZE * net_return,
+            })
 
-    # All intraday trades close same day
-    open_positions = max(0, open_positions - len(trades))
-    return trades, open_positions
+    return trades
 
 
 # ── Metrics ───────────────────────────────────────────────────────────────────
@@ -155,36 +135,32 @@ def _report(trades: list[dict]) -> None:
         return
 
     df = pd.DataFrame(trades)
-    total_pnl    = df["pnl"].sum()
-    total_cost   = POSITION_SIZE * len(df) * COST_RT
-    win_rate     = (df["net_return"] > 0).mean()
-    avg_ret      = df["net_return"].mean() * 100
-    avg_win      = df.loc[df["net_return"] > 0, "net_return"].mean() * 100
-    avg_loss     = df.loc[df["net_return"] < 0, "net_return"].mean() * 100
+    total_pnl  = df["pnl"].sum()
+    total_cost = POSITION_SIZE * len(df) * COST_RT
+    win_rate   = (df["net_return"] > 0).mean()
+    avg_ret    = df["net_return"].mean() * 100
+    avg_win    = df.loc[df["net_return"] > 0, "net_return"].mean() * 100
+    avg_loss   = df.loc[df["net_return"] < 0, "net_return"].mean() * 100
 
-    # Cumulative P&L drawdown
-    cumulative   = df["pnl"].cumsum()
-    rolling_max  = cumulative.cummax()
-    drawdown     = (cumulative - rolling_max)
-    max_dd       = drawdown.min()
+    cumulative = df["pnl"].cumsum()
+    max_dd     = (cumulative - cumulative.cummax()).min()
 
-    # Sharpe (daily P&L)
-    daily_pnl = df.groupby("date_str")["pnl"].sum()
-    sharpe    = (daily_pnl.mean() / (daily_pnl.std() + 1e-8)) * np.sqrt(252)
+    daily_pnl  = df.groupby("date_str")["pnl"].sum()
+    sharpe     = (daily_pnl.mean() / (daily_pnl.std() + 1e-8)) * np.sqrt(252)
 
     print("\n" + "=" * 50)
     print("BACKTEST RESULTS — May 2026")
     print("=" * 50)
-    print(f"Trades:          {len(df):,}")
-    print(f"Long / Short:    {(df['direction']=='long').sum()} / {(df['direction']=='short').sum()}")
-    print(f"Win rate:        {win_rate:.1%}")
-    print(f"Avg return:      {avg_ret:.3f}%")
-    print(f"Avg win:         {avg_win:.3f}%")
-    print(f"Avg loss:        {avg_loss:.3f}%")
-    print(f"Total P&L:       ${total_pnl:,.2f}")
-    print(f"Total costs:     ${total_cost:,.2f}")
-    print(f"Max drawdown:    ${max_dd:,.2f}")
-    print(f"Approx Sharpe:   {sharpe:.2f}")
+    print(f"Trades:        {len(df):,}  ({len(df)//len(daily_pnl)} per day)")
+    print(f"Scans:         10:00 + 13:00 ET, top {TRADES_PER_SCAN} longs each")
+    print(f"Win rate:      {win_rate:.1%}")
+    print(f"Avg return:    {avg_ret:.3f}%")
+    print(f"Avg win:       {avg_win:.3f}%")
+    print(f"Avg loss:      {avg_loss:.3f}%")
+    print(f"Total P&L:     ${total_pnl:,.2f}")
+    print(f"Total costs:   ${total_cost:,.2f}")
+    print(f"Max drawdown:  ${max_dd:,.2f}")
+    print(f"Sharpe:        {sharpe:.2f}")
     print("=" * 50)
 
     df.to_csv("ml/backtest_trades.csv", index=False)
@@ -197,20 +173,16 @@ def run(checkpoint_path: str) -> None:
     device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
     print(f"Device: {device}")
 
-    # Load model
     model = MinuteBarTransformer(input_dim=7, d_model=128, nhead=8, num_layers=4).to(device)
     ckpt  = torch.load(checkpoint_path, map_location=device)
     state = ckpt["model"] if "model" in ckpt else ckpt
     model.load_state_dict(state)
     model.eval()
-    print(f"Loaded checkpoint: {checkpoint_path}")
+    print(f"Loaded: {checkpoint_path}")
 
-    import queue, threading
-    keys = list_keys(date(2026, 5, 1), date(2026, 6, 1))
-    all_trades     = []
-    open_positions = 0
-    _SENTINEL      = object()
-
+    keys       = list_keys(date(2026, 5, 1), date(2026, 6, 1))
+    all_trades = []
+    _SENTINEL  = object()
     buf: queue.Queue = queue.Queue(maxsize=4)
 
     def _producer():
@@ -228,9 +200,9 @@ def run(checkpoint_path: str) -> None:
             item = buf.get()
             if item is _SENTINEL:
                 break
-            key, df = item
-            date_str = key.split("/")[-1].replace(".csv.gz", "")
-            trades, open_positions = _simulate_day(df, model, device, open_positions)
+            key, df   = item
+            date_str  = key.split("/")[-1].replace(".csv.gz", "")
+            trades    = _simulate_day(df, model, device)
             for t in trades:
                 t["date_str"] = date_str
             all_trades.extend(trades)
