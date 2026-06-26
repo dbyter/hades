@@ -53,33 +53,45 @@ def _load_day(key: str) -> pd.DataFrame:
 
 # ── Signal generation ─────────────────────────────────────────────────────────
 
-def _score_ticker(
-    group: pd.DataFrame,
+def _simulate_day(
+    df: pd.DataFrame,
     model: MinuteBarTransformer,
     device: str,
-) -> list[dict]:
-    """Return list of trade candidates for one ticker on one day."""
-    if len(group) < SEQ_LEN + HORIZON:
-        return []
+    open_positions: int,
+) -> tuple[list[dict], int]:
+    """Score all tickers in one batched GPU call, select top signals, simulate trades."""
+    all_windows = []
+    meta        = []  # (ticker, i, opens)
 
-    features = _make_features(group.reset_index(drop=True))
-    opens    = group["open"].values
-    n_windows = len(features) - SEQ_LEN - HORIZON + 1
+    for ticker, group in df.groupby("ticker", sort=False):
+        group = group.reset_index(drop=True)
+        if len(group) < SEQ_LEN + HORIZON:
+            continue
+        features  = _make_features(group)
+        opens     = group["open"].values
+        n_windows = len(features) - SEQ_LEN - HORIZON + 1
+        for i in range(n_windows):
+            all_windows.append(features[i : i + SEQ_LEN])
+            meta.append((ticker, i, opens))
 
-    # Stack all windows into a single batch
-    windows = np.stack([features[i : i + SEQ_LEN] for i in range(n_windows)])
+    if not all_windows:
+        return [], open_positions
+
+    # Single forward pass for the entire day
+    batch = torch.from_numpy(np.stack(all_windows)).to(device)
     with torch.no_grad():
-        preds = model(torch.from_numpy(windows).to(device)).cpu().numpy()
+        preds = model(batch).cpu().numpy()
 
-    candidates = []
-    for i, pred in enumerate(preds):
+    all_candidates = []
+    for pred, (ticker, i, opens) in zip(preds, meta):
         if abs(pred) < THRESHOLD:
             continue
         entry_idx = i + SEQ_LEN
         exit_idx  = i + SEQ_LEN + HORIZON
         if exit_idx >= len(opens):
             continue
-        candidates.append({
+        all_candidates.append({
+            "ticker":      ticker,
             "entry_bar":   entry_idx,
             "exit_bar":    exit_idx,
             "entry_price": opens[entry_idx],
@@ -87,27 +99,6 @@ def _score_ticker(
             "prediction":  float(pred),
             "direction":   1 if pred > 0 else -1,
         })
-
-    return candidates
-
-
-# ── Trade simulation ──────────────────────────────────────────────────────────
-
-def _simulate_day(
-    df: pd.DataFrame,
-    model: MinuteBarTransformer,
-    device: str,
-    open_positions: int,
-) -> tuple[list[dict], int]:
-    """Score all tickers, select top signals, simulate trades. Returns (trades, final_open_positions)."""
-    all_candidates = []
-    tickers = list(df.groupby("ticker", sort=False))
-
-    for ticker, group in tqdm(tickers, desc="  tickers", unit="ticker", leave=False):
-        candidates = _score_ticker(group.reset_index(drop=True), model, device)
-        for c in candidates:
-            c["ticker"] = ticker
-        all_candidates.extend(candidates)
 
 
     # Sort by signal strength, take top signals respecting position cap
@@ -210,23 +201,37 @@ def run(checkpoint_path: str) -> None:
     model.eval()
     print(f"Loaded checkpoint: {checkpoint_path}")
 
+    import queue, threading
     keys = list_keys(date(2026, 5, 1), date(2026, 6, 1))
-    all_trades   = []
+    all_trades     = []
     open_positions = 0
+    _SENTINEL      = object()
 
-    for key in tqdm(keys, desc="days", unit="day"):
-        try:
-            df = _load_day(key)
-        except Exception as e:
-            tqdm.write(f"Warning: skipping {key} — {e}")
-            continue
+    buf: queue.Queue = queue.Queue(maxsize=4)
 
-        date_str = key.split("/")[-1].replace(".csv.gz", "")
-        trades, open_positions = _simulate_day(df, model, device, open_positions)
-        for t in trades:
-            t["date_str"] = date_str
-        all_trades.extend(trades)
-        tqdm.write(f"{date_str}  trades={len(trades)}  cumulative={len(all_trades)}")
+    def _producer():
+        for key in keys:
+            try:
+                buf.put((key, _load_day(key)))
+            except Exception as e:
+                tqdm.write(f"Warning: skipping {key} — {e}")
+        buf.put(_SENTINEL)
+
+    threading.Thread(target=_producer, daemon=True).start()
+
+    with tqdm(total=len(keys), desc="days", unit="day") as bar:
+        while True:
+            item = buf.get()
+            if item is _SENTINEL:
+                break
+            key, df = item
+            date_str = key.split("/")[-1].replace(".csv.gz", "")
+            trades, open_positions = _simulate_day(df, model, device, open_positions)
+            for t in trades:
+                t["date_str"] = date_str
+            all_trades.extend(trades)
+            tqdm.write(f"{date_str}  trades={len(trades)}  cumulative={len(all_trades)}")
+            bar.update(1)
 
     _report(all_trades)
 
