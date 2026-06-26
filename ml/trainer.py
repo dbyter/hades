@@ -53,13 +53,13 @@ def train(
     dataset = MinuteBarDataset(start=start, end=end, seq_len=seq_len, tickers=tickers)
     loader  = DataLoader(dataset, batch_size=batch_size, num_workers=0)
 
-    model     = MinuteBarTransformer(input_dim=4, d_model=128, nhead=8, num_layers=4).to(device)
+    model     = MinuteBarTransformer(input_dim=7, d_model=128, nhead=8, num_layers=4).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-2)
     criterion = nn.MSELoss()
 
-    # Estimate total steps for cosine decay — ~530 batches/day, ~21 trading days/month
+    # Estimate total steps for cosine decay — ~2800 batches/day, ~21 trading days/month
     trading_days = max(1, (end - start).days * 5 // 7)
-    total_steps  = epochs * trading_days * 530
+    total_steps  = epochs * trading_days * 2800
     scheduler    = torch.optim.lr_scheduler.LambdaLR(
         optimizer, lr_lambda=lambda step: _lr_lambda(step, warmup_steps, total_steps)
     )

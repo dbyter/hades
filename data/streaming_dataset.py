@@ -3,8 +3,9 @@ Streaming PyTorch IterableDataset over Massive.com minute-bar flat files.
 
 Streams daily .csv.gz files directly from S3 without writing to disk.
 Yields (window, label) pairs where:
-  - window: float32 tensor of shape (seq_len, 4) — [log_ret, high_ret, low_ret, vol_z]
-  - label:  float32 scalar — 1.0 if next bar close > current bar close, else 0.0
+  - window: float32 tensor of shape (seq_len, 7) — [log_ret, high_ret, low_ret, vol_z,
+                                                     time_of_day, intraday_vol, return_vs_open]
+  - label:  float32 scalar — log return over the next `horizon` bars
 
 Requires MASSIVE_ACCESS_KEY and MASSIVE_SECRET_KEY in .env.
 """
@@ -78,20 +79,39 @@ def _stream_day(key: str) -> pd.DataFrame:
     return df.sort_values(["ticker", "dt"])
 
 
+BARS_IN_SESSION = 390.0
+
+
 def _make_features(group: pd.DataFrame) -> np.ndarray:
     closes  = group["close"].values
     opens   = group["open"].values
     highs   = group["high"].values
     lows    = group["low"].values
     volumes = group["volume"].values
+    n       = len(closes)
 
+    # --- original 4 features ---
     log_ret  = np.concatenate([[0.0], np.log(closes[1:] / np.maximum(closes[:-1], 1e-8))])
     high_ret = np.log(np.maximum(highs / np.maximum(opens, 1e-8), 1e-8))
     low_ret  = np.log(np.maximum(lows  / np.maximum(opens, 1e-8), 1e-8))
+    vol_z    = (volumes - volumes.mean()) / (volumes.std() + 1e-8)
 
-    vol_z = (volumes - volumes.mean()) / (volumes.std() + 1e-8)
+    # --- 3 regime features (per bar) ---
+    # time of day: 0.0 at 9:30, 1.0 at 16:00
+    time_of_day = np.arange(n, dtype=np.float32) / BARS_IN_SESSION
 
-    return np.column_stack([log_ret, high_ret, low_ret, vol_z]).astype(np.float32)
+    # intraday realised vol: expanding std of log_ret from bar 0
+    intraday_vol = np.zeros(n, dtype=np.float32)
+    for j in range(2, n):
+        intraday_vol[j] = log_ret[:j].std()
+
+    # return from open: log(close / first bar open)
+    day_open      = opens[0]
+    return_vs_open = np.log(closes / max(day_open, 1e-8)).astype(np.float32)
+
+    return np.column_stack(
+        [log_ret, high_ret, low_ret, vol_z, time_of_day, intraday_vol, return_vs_open]
+    ).astype(np.float32)
 
 
 _SENTINEL = object()

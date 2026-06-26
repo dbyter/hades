@@ -12,7 +12,7 @@ class MinuteBarTransformer(nn.Module):
 
     def __init__(
         self,
-        input_dim: int = 4,
+        input_dim: int = 7,
         seq_len: int = 60,
         d_model: int = 128,
         nhead: int = 8,
