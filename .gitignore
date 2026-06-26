@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environment
+.venv
+
+# Credentials
+.env
+
+# Downloaded market data
+data/*.csv
+data/*.parquet
+
+# Personal portfolio state
+data/positions.json
+data/nav_history.json
+data/insights_cache.json
+data/ratings_cache.json
+data/names_cache.json
+
+# Generated outputs
+daily_output.html
+backtest_trades.xlsx
+~$*.xlsx
+
+# Trained model weights
+ml/*.pt
+
+# IDE / tooling
+.claude/
