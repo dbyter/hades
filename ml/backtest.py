@@ -163,10 +163,9 @@ def _report(trades: list[dict]) -> None:
     drawdown     = (cumulative - rolling_max)
     max_dd       = drawdown.min()
 
-    # Rough Sharpe (daily P&L)
-    df["date_str"] = df.get("date", pd.Series(["?"] * len(df)))
-    daily_pnl    = df.groupby("date_str")["pnl"].sum()
-    sharpe       = (daily_pnl.mean() / (daily_pnl.std() + 1e-8)) * np.sqrt(252)
+    # Sharpe (daily P&L)
+    daily_pnl = df.groupby("date_str")["pnl"].sum()
+    sharpe    = (daily_pnl.mean() / (daily_pnl.std() + 1e-8)) * np.sqrt(252)
 
     print("\n" + "=" * 50)
     print("BACKTEST RESULTS — May 2026")
