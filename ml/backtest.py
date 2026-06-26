@@ -77,10 +77,15 @@ def _simulate_day(
     if not all_windows:
         return [], open_positions
 
-    # Single forward pass for the entire day
-    batch = torch.from_numpy(np.stack(all_windows)).to(device)
+    # Chunked forward pass to avoid OOM
+    all_windows_np = np.stack(all_windows)
+    preds = []
+    chunk_size = 4096
     with torch.no_grad():
-        preds = model(batch).cpu().numpy()
+        for i in range(0, len(all_windows_np), chunk_size):
+            chunk = torch.from_numpy(all_windows_np[i : i + chunk_size]).to(device)
+            preds.append(model(chunk).cpu().numpy())
+    preds = np.concatenate(preds)
 
     all_candidates = []
     for pred, (ticker, i, opens) in zip(preds, meta):
