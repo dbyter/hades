@@ -1,11 +1,16 @@
 """
-Minimal training loop for MinuteBarTransformer.
+Single-pass trainer for MinuteBarTransformer.
+
+Streams data once across the full training date range, checkpointing every
+`checkpoint_every` steps. No epochs — the dataset is large enough that a
+single pass is sufficient and avoids overfitting to early data.
 
 Usage:
     python -m ml.trainer
 """
 
 import math
+import os
 from datetime import date
 from pathlib import Path
 
@@ -20,6 +25,8 @@ load_dotenv(Path(__file__).parent.parent / ".env")
 from data.streaming_dataset import MinuteBarDataset
 from ml.model import MinuteBarTransformer
 
+CHECKPOINT_DIR = Path("ml/checkpoints")
+
 
 def _device() -> str:
     if torch.cuda.is_available():
@@ -29,78 +36,89 @@ def _device() -> str:
     return "cpu"
 
 
-def _lr_lambda(step: int, warmup_steps: int, total_steps: int) -> float:
+def _warmup_lambda(step: int, warmup_steps: int) -> float:
     if step < warmup_steps:
         return step / max(1, warmup_steps)
-    progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
-    return 0.5 * (1.0 + math.cos(math.pi * progress))
+    return 1.0
 
 
 def train(
-    start: date = date(2024, 1, 1),
-    end: date = date(2024, 2, 1),
-    seq_len: int = 60,
-    batch_size: int = 256,
-    epochs: int = 5,
-    lr: float = 3e-4,
-    warmup_steps: int = 500,
+    train_start: date = date(2026, 4, 1),
+    train_end: date   = date(2026, 5, 1),
+    seq_len: int      = 60,
+    horizon: int      = 60,
+    batch_size: int   = 256,
+    lr: float         = 3e-4,
+    warmup_steps: int = 1000,
+    checkpoint_every: int = 10_000,
     tickers: list[str] | None = None,
-    save_path: str = "ml/model.pt",
+    save_path: str = "ml/model_final.pt",
 ) -> MinuteBarTransformer:
     device = _device()
-    print(f"Device: {device}")
+    CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+    tqdm.write(f"Device: {device}")
+    tqdm.write(f"Training {train_start} → {train_end}")
 
-    dataset = MinuteBarDataset(start=start, end=end, seq_len=seq_len, tickers=tickers)
-    loader  = DataLoader(dataset, batch_size=batch_size, num_workers=0)
+    dataset = MinuteBarDataset(
+        start=train_start, end=train_end,
+        seq_len=seq_len, horizon=horizon,
+        tickers=tickers,
+    )
+    loader = DataLoader(dataset, batch_size=batch_size, num_workers=0)
 
     model     = MinuteBarTransformer(input_dim=7, d_model=128, nhead=8, num_layers=4).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-2)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(
+        optimizer, lr_lambda=lambda step: _warmup_lambda(step, warmup_steps)
+    )
     criterion = nn.MSELoss()
 
-    # Estimate total steps for cosine decay — ~2800 batches/day, ~21 trading days/month
-    trading_days = max(1, (end - start).days * 5 // 7)
-    total_steps  = epochs * trading_days * 2800
-    scheduler    = torch.optim.lr_scheduler.LambdaLR(
-        optimizer, lr_lambda=lambda step: _lr_lambda(step, warmup_steps, total_steps)
-    )
+    tqdm.write(f"LR: warmup over {warmup_steps} steps → constant {lr:.0e}")
 
-    tqdm.write(f"LR schedule: warmup {warmup_steps} steps → cosine decay over ~{total_steps:,} steps")
+    step = 0
+    total_loss = total_mae = total = 0
 
-    global_step = 0
-    for epoch in range(1, epochs + 1):
-        model.train()
-        total_loss = total_mae = total = 0
+    bar = tqdm(loader, desc="Training", unit="batch")
+    for batch_x, batch_y in bar:
+        batch_x, batch_y = batch_x.to(device), batch_y.to(device)
 
-        bar = tqdm(loader, desc=f"Epoch {epoch}/{epochs}", unit="batch", leave=False)
-        for batch_x, batch_y in bar:
-            batch_x, batch_y = batch_x.to(device), batch_y.to(device)
+        optimizer.zero_grad()
+        preds = model(batch_x)
+        loss  = criterion(preds, batch_y)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()
+        scheduler.step()
+        step += 1
 
-            optimizer.zero_grad()
-            preds = model(batch_x)
-            loss  = criterion(preds, batch_y)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
-            scheduler.step()
-            global_step += 1
+        total_loss += loss.item() * len(batch_y)
+        total_mae  += (preds - batch_y).abs().sum().item()
+        total      += len(batch_y)
 
-            total_loss += loss.item() * len(batch_y)
-            total_mae  += (preds - batch_y).abs().sum().item()
-            total      += len(batch_y)
-
-            bar.set_postfix(
-                mse=f"{total_loss/total:.6f}",
-                mae=f"{total_mae/total:.4f}",
-                lr=f"{scheduler.get_last_lr()[0]:.2e}",
-            )
-
-        tqdm.write(
-            f"Epoch {epoch}/{epochs}  mse={total_loss/total:.6f}  "
-            f"mae={total_mae/total:.4f}  lr={scheduler.get_last_lr()[0]:.2e}"
+        bar.set_postfix(
+            step=step,
+            mse=f"{total_loss/total:.6f}",
+            mae=f"{total_mae/total:.4f}",
+            lr=f"{scheduler.get_last_lr()[0]:.2e}",
         )
 
+        if step % checkpoint_every == 0:
+            ckpt = CHECKPOINT_DIR / f"model_step{step:08d}.pt"
+            torch.save({
+                "step":       step,
+                "model":      model.state_dict(),
+                "optimizer":  optimizer.state_dict(),
+                "scheduler":  scheduler.state_dict(),
+                "mse":        total_loss / total,
+                "mae":        total_mae / total,
+            }, ckpt)
+            tqdm.write(
+                f"[step {step:,}] checkpoint saved → {ckpt}  "
+                f"mse={total_loss/total:.6f}  mae={total_mae/total:.4f}"
+            )
+
     torch.save(model.state_dict(), save_path)
-    tqdm.write(f"Saved → {save_path}")
+    tqdm.write(f"Done. Final model saved → {save_path}")
     return model
 
 
