@@ -36,10 +36,11 @@ def _device() -> str:
     return "cpu"
 
 
-def _warmup_lambda(step: int, warmup_steps: int) -> float:
+def _lr_lambda(step: int, warmup_steps: int, total_steps: int) -> float:
     if step < warmup_steps:
         return step / max(1, warmup_steps)
-    return 1.0
+    progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+    return 0.5 * (1.0 + math.cos(math.pi * progress))
 
 
 def train(
@@ -50,6 +51,7 @@ def train(
     batch_size: int   = 256,
     lr: float         = 3e-4,
     warmup_steps: int = 1000,
+    total_steps: int = 72_000,
     checkpoint_every: int = 10_000,
     tickers: list[str] | None = None,
     save_path: str = "ml/model_final.pt",
@@ -69,14 +71,19 @@ def train(
     model     = MinuteBarTransformer(input_dim=7, d_model=128, nhead=8, num_layers=4).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-2)
     scheduler = torch.optim.lr_scheduler.LambdaLR(
-        optimizer, lr_lambda=lambda step: _warmup_lambda(step, warmup_steps)
+        optimizer, lr_lambda=lambda step: _lr_lambda(step, warmup_steps, total_steps)
     )
-    criterion = nn.MSELoss()
+    def criterion(preds, labels):
+        preds_c  = preds  - preds.mean()
+        labels_c = labels - labels.mean()
+        corr = (preds_c * labels_c).sum() / (preds_c.norm() * labels_c.norm() + 1e-8)
+        return -corr
 
-    tqdm.write(f"LR: warmup over {warmup_steps} steps → constant {lr:.0e}")
+    tqdm.write(f"LR: warmup {warmup_steps} steps → cosine decay over {total_steps:,} steps")
 
     step = 0
     total_loss = total_mae = total = 0
+    total_corr = 0
 
     bar = tqdm(loader, desc="Training", unit="batch")
     for batch_x, batch_y in bar:
@@ -91,13 +98,13 @@ def train(
         scheduler.step()
         step += 1
 
-        total_loss += loss.item() * len(batch_y)
+        total_corr += -loss.item()
         total_mae  += (preds - batch_y).abs().sum().item()
         total      += len(batch_y)
 
         bar.set_postfix(
             step=step,
-            mse=f"{total_loss/total:.6f}",
+            corr=f"{total_corr/step:.4f}",
             mae=f"{total_mae/total:.4f}",
             lr=f"{scheduler.get_last_lr()[0]:.2e}",
         )
@@ -105,16 +112,16 @@ def train(
         if step % checkpoint_every == 0:
             ckpt = CHECKPOINT_DIR / f"model_step{step:08d}.pt"
             torch.save({
-                "step":       step,
-                "model":      model.state_dict(),
-                "optimizer":  optimizer.state_dict(),
-                "scheduler":  scheduler.state_dict(),
-                "mse":        total_loss / total,
-                "mae":        total_mae / total,
+                "step":      step,
+                "model":     model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "scheduler": scheduler.state_dict(),
+                "corr":      total_corr / step,
+                "mae":       total_mae / total,
             }, ckpt)
             tqdm.write(
                 f"[step {step:,}] checkpoint saved → {ckpt}  "
-                f"mse={total_loss/total:.6f}  mae={total_mae/total:.4f}"
+                f"corr={total_corr/step:.4f}  mae={total_mae/total:.4f}"
             )
 
     torch.save(model.state_dict(), save_path)
